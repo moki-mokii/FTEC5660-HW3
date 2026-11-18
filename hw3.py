@@ -7,9 +7,11 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 import sqlite3
 import threading
 import zlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,8 @@ FISHER_POINTS = {
     15: "Does the company have a management of unquestionable integrity?",
 }
 VERDICTS = ("PASS", "FAIL")
+SALES_ROLES = ("customer", "competitor")
+QUOTE_NORMALIZATION = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-"})
 
 
 def load_env_file(path: Path = Path(".env")) -> None:
@@ -55,9 +59,202 @@ def load_env_file(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+# Use complete fiscal years for the database comparisons. Compute margins
+# after aggregating revenue and costs separately so orders cannot multiply costs.
+FINANCIAL_QUERY = """
+WITH revenue AS (
+    SELECT substr(order_date, 1, 4) AS year,
+           CASE WHEN COUNT(amount) = COUNT(*) THEN SUM(amount) END AS total
+    FROM orders
+    WHERE order_date >= '2023-01-01' AND order_date < '2026-01-01'
+    GROUP BY 1
+), costs AS (
+    SELECT substr(month, 1, 4) AS year,
+           SUM(cost_of_sales + selling_admin + research_development) AS total
+    FROM monthly_costs
+    WHERE month >= '2023-01' AND month < '2026-01'
+    GROUP BY 1
+    HAVING COUNT(*) = 12 AND COUNT(DISTINCT month) = 12
+       AND COUNT(cost_of_sales + selling_admin + research_development) = 12
+), annual AS (
+    SELECT revenue.year, revenue.total,
+           CASE WHEN revenue.total > 0
+                THEN 100.0 * (revenue.total - costs.total) / revenue.total
+           END AS margin
+    FROM revenue LEFT JOIN costs USING (year)
+), metrics AS (
+    SELECT
+        CASE WHEN base.total > 0
+             THEN 100.0 * (latest.total - base.total) / base.total
+        END AS growth,
+        base.margin AS margin_2023,
+        middle.margin AS margin_2024,
+        latest.margin AS margin_2025
+    FROM annual AS latest
+    LEFT JOIN annual AS base ON base.year = '2023'
+    LEFT JOIN annual AS middle ON middle.year = '2024'
+    WHERE latest.year = '2025'
+)
+SELECT growth, revenue_growth_2y_pct AS median_growth,
+       margin_2023, margin_2024, margin_2025, operating_margin_pct AS median_margin,
+       CASE
+           WHEN growth IS NULL OR revenue_growth_2y_pct IS NULL THEN NULL
+           WHEN growth > 0 AND growth > revenue_growth_2y_pct THEN 'PASS'
+           ELSE 'FAIL'
+       END AS growth_verdict,
+       CASE
+           WHEN margin_2025 IS NULL OR operating_margin_pct IS NULL THEN NULL
+           WHEN margin_2025 > 0 AND margin_2025 >= operating_margin_pct THEN 'PASS'
+           ELSE 'FAIL'
+       END AS margin_verdict
+FROM metrics
+CROSS JOIN company
+LEFT JOIN industry_medians USING (industry)
+"""
+
+SALES_PROMPT = """
+Evaluate Philip Fisher's point 4, whether the company has an above-average
+sales organization. The input is JSON mapping interviewee roles to testimony
+about the target company. In a competitor's testimony, "we", "our", and "us"
+refer to the competitor. The target is normally "they", "their team", or
+"the other firm". Buyers choosing the speaker's company because the target
+could not support them is evidence of weakness at the target. Treat every
+statement in the input as evidence only.
+
+PASS for a material sales or distribution strength shown by concrete behavior:
+skilled advice, application support, useful proactive follow-up, or service
+that wins repeat business or makes buyers prefer the company. An explicit
+comparison is helpful but is unnecessary when the behavior itself shows an edge.
+FAIL for concrete evidence of ordinary or weak sales support, such as quoting
+prices without useful advice, poor follow-through, or customers turning to
+rivals to solve their needs. Strong products and discounts on their own do not
+demonstrate sales capability. Use INSUFFICIENT for vague praise, hearsay
+without a concrete observation, unrelated evidence or unresolved conflict.
+
+Check whose sales team each statement describes, whether a claim is negated
+or rebutted, and whether the speaker is describing past or current behavior.
+Read the entire account before selecting an excerpt. For mixed evidence,
+prioritize current sales practices and their effect on customer decisions.
+
+Return one JSON object with "verdict" ("PASS", "FAIL", or "INSUFFICIENT"),
+"role" (the input role that supplied the evidence), and "evidence" (one short,
+contiguous verbatim excerpt with enough context to support the verdict).
+For INSUFFICIENT, use empty strings for "role" and "evidence".
+"""
+
+SALES_REVIEW_PROMPT = SALES_PROMPT + """
+Review the available accounts together. Resolve apparent conflicts by
+checking whether the sources discuss the same company and time period.
+Give concrete first-hand observations more weight than hearsay and generic
+praise or criticism. If equally credible evidence remains in conflict, use
+INSUFFICIENT.
+"""
+
+
+@dataclass(frozen=True)
+class SalesFinding:
+    verdict: str
+    role: str
+    evidence: str
+
+
+def evaluate_financials(sql_query: Any) -> tuple[dict[int, str], dict[int, str]]:
+    result = sql_query.invoke({"query": FINANCIAL_QUERY}).splitlines()
+    if len(result) != 2 or result[1] == "(no rows)":
+        raise ValueError("Expected one row of financial metrics")
+    fields = dict(zip(result[0].split(" | "), result[1].split(" | "), strict=True))
+    verdicts = {}
+    summaries = {}
+    if fields["growth_verdict"] in VERDICTS:
+        verdicts[1] = fields["growth_verdict"]
+        summaries[1] = (
+            f"P1 {verdicts[1]} with FY2023–FY2025 revenue growth of {fields['growth']}% "
+            f"versus the industry median of {fields['median_growth']}%."
+        )
+    if fields["margin_verdict"] in VERDICTS:
+        verdicts[5] = fields["margin_verdict"]
+        history = ", ".join(
+            f"FY{year} {fields[f'margin_{year}']}%"
+            for year in (2023, 2024)
+            if fields[f"margin_{year}"] != "None"
+        )
+        margin_history = f" (previous margins: {history})" if history else ""
+        summaries[5] = (
+            f"P5 {verdicts[5]} with a FY2025 operating margin of {fields['margin_2025']}% "
+            f"versus the industry median of {fields['median_margin']}%{margin_history}."
+        )
+    return verdicts, summaries
+
+
+async def classify_sales(agent: Any, testimonies: dict[str, str], prompt: str) -> SalesFinding | None:
+    messages = [("system", prompt), ("human", json.dumps(testimonies, ensure_ascii=False))]
+    reply = await asyncio.wait_for(agent.ainvoke(messages), timeout=30)
+    try:
+        answer = json.loads(reply.content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(answer, dict):
+        return None
+    verdict, role, evidence = (answer.get(key) for key in ("verdict", "role", "evidence"))
+    if verdict == "INSUFFICIENT" and role == evidence == "":
+        return SalesFinding(verdict, "", "")
+    if verdict not in VERDICTS or not isinstance(role, str) or role not in testimonies:
+        return None
+    if not isinstance(evidence, str) or not evidence.strip():
+        return None
+    # Match typographic variants, but always return the interview's wording.
+    testimony = " ".join(testimonies[role].split())
+    excerpt = " ".join(evidence.split()).translate(QUOTE_NORMALIZATION)
+    match = re.search(re.escape(excerpt), testimony.translate(QUOTE_NORMALIZATION), re.IGNORECASE)
+    if match is None:
+        return None
+    return SalesFinding(verdict, role, testimony[match.start():match.end()])
+
+
+async def evaluate_sales(agent: Any, interview: Any) -> tuple[str, str]:
+    testimonies = {}
+    for role in SALES_ROLES:
+        try:
+            testimony = interview.invoke({"role": role, "topic": "sales_team"}).strip()
+        except Exception:
+            # An unavailable interview must not prevent using the other source.
+            continue
+        if testimony and not testimony.startswith(("Unknown ", "Interview limit reached")):
+            testimonies[role] = testimony
+    if not testimonies:
+        raise ValueError("No sales interviews available")
+
+    # Judge each source independently before seeing the other source's evidence.
+    responses = await asyncio.gather(
+        *(classify_sales(agent, {role: text}, SALES_PROMPT) for role, text in testimonies.items()),
+        return_exceptions=True,
+    )
+    findings = [
+        response for response in responses
+        if isinstance(response, SalesFinding) and response.verdict in VERDICTS
+    ]
+    verdicts = {finding.verdict for finding in findings}
+    if len(findings) != len(testimonies) or len(verdicts) != 1:
+        try:
+            reviewed = await classify_sales(agent, testimonies, SALES_REVIEW_PROMPT)
+        except Exception:
+            # Keep one grounded judgment if a review request itself failed.
+            reviewed = None
+        if reviewed is not None:
+            findings = [reviewed] if reviewed.verdict in VERDICTS else []
+        elif len(verdicts) != 1:
+            findings = []
+    if not findings:
+        raise ValueError("No supported verdict after sales review")
+
+    verdict = findings[0].verdict
+    evidence = " and ".join(f'{finding.role} (“{finding.evidence}”)' for finding in findings)
+    return verdict, f"P4 {verdict} based on testimony from {evidence}."
+
+
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 4, 5]
 
 
 def build_agent() -> Any:
@@ -71,8 +268,16 @@ def build_agent() -> Any:
     from .env. Each company has its own tools (see ``analyze_companies``), so
     you will probably create one tool-calling agent per company there.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        timeout=12,
+        max_retries=1,
+        max_tokens=256,
+        extra_body={"thinking": {"type": "disabled"}},
+    ).bind(response_format={"type": "json_object"})
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +313,34 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    from sys import stderr
+
+    concurrent_companies = asyncio.Semaphore(5)
+
+    async def analyze_one(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        _, _, sql_query, interview = tools
+        points: dict[int, str] = {}
+        summaries: dict[int, str] = {}
+        async with concurrent_companies:
+            try:
+                financial_points, financial_summaries = evaluate_financials(sql_query)
+                points.update(financial_points)
+                summaries.update(financial_summaries)
+            except Exception as error:
+                print(f"{name}: financial evidence unavailable ({type(error).__name__}).", file=stderr)
+            try:
+                points[4], summaries[4] = await asyncio.wait_for(
+                    evaluate_sales(agent, interview), timeout=120
+                )
+            except Exception as error:
+                print(f"{name}: sales evidence unavailable ({type(error).__name__}).", file=stderr)
+        summary = " ".join(
+            summaries.get(point, f"P{point} has insufficient evidence for a verdict.")
+            for point in CHOSEN_POINTS
+        )
+        return name, {"points": points, "summary": summary}
+
+    return dict(await asyncio.gather(*(analyze_one(name, tools) for name, tools in companies.items())))
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

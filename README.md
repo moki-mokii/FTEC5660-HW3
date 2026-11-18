@@ -170,14 +170,166 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
 
-### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+### My three points and rules
 
-### Design
-> a visualization of your agent design and one paragraph describing it.
+I chose points **1, 4, and 5** to examine three aspects of a growth company:
+its sales growth, the quality of its sales organization, and how much operating
+profit it earns from its revenue.
 
-### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+#### Point 1 · Market potential for sales growth
+
+I chose this point because a multiyear sales record gives a starting point for
+assessing growth potential. Fisher observes that even exceptional companies
+can grow in uneven spurts and recommends looking at “units of several years
+each.” (Fisher, Part One, Chapter 3, pp. 47–53.)
+
+**PASS rule.** Cumulative revenue growth from FY2023 to FY2025 must be positive
+and strictly greater than the company's own industry median for two-year
+revenue growth.
+
+**Evidence.** The SQL tool sums `orders.amount` for the two complete fiscal
+years, calculates `100 × (FY2025 revenue − FY2023 revenue) / FY2023 revenue`,
+and retrieves `revenue_growth_2y_pct` for the industry identified in `company`.
+Historical growth is a proxy for the forward-looking potential Fisher asks about.
+
+#### Point 4 · Above-average sales organization
+
+I chose this point because customers and competitors can describe how reps
+actually help buyers evaluate and use a product. Fisher identifies “repeat
+sales to satisfied customers” as an early sign of success and recommends
+asking both groups about the sales organization. (Fisher, Part One, Chapter 3,
+pp. 59–62.)
+
+**PASS rule.** Interview testimony must describe a material sales or distribution
+strength, such as skilled application advice, useful proactive follow-up, or
+service that earns customer preference. Concrete evidence of ordinary or weak
+support yields FAIL, while vague, unrelated, or unresolved evidence leaves the
+verdict missing.
+
+**Evidence.** The agent calls `interview` with topic `sales_team` for a customer
+and a competitor. It validates each cited excerpt against the corresponding
+transcript and considers who provided the support, when it happened, and how
+it affected the buyer's decision.
+
+#### Point 5 · Worthwhile profit margin
+
+I chose this point because rising sales matter to investors when they lead to
+operating profit. Fisher compares margins among companies in the same industry
+and looks across years because an unusually strong year can temporarily lift
+the margins of weaker firms. (Fisher, Part One, Chapter 3, pp. 62–63.)
+
+**PASS rule.** The FY2025 operating margin must be positive and at least as high
+as the company's industry median operating margin.
+
+**Evidence.** The SQL tool sums order revenue and monthly cost of sales,
+selling and administrative expenses, and R&D separately. It subtracts those
+costs from revenue, divides by revenue, and compares the percentage with
+`industry_medians.operating_margin_pct` for the company's industry. The verdict
+uses FY2025, the latest complete fiscal year, and the summary includes FY2023
+and FY2024 margins where available to show the historical context.
+
+### Agent design
+
+```mermaid
+flowchart TD
+    company["One company and its LangChain tools"] --> sql["sql_query<br/>Annual revenue, costs, and industry medians"]
+    sql --> financial["SQL rules for points 1 and 5"]
+    company --> customer["interview<br/>Customer on sales_team"]
+    company --> competitor["interview<br/>Competitor on sales_team"]
+    customer --> customer_model["DeepSeek classifies customer testimony"]
+    competitor --> competitor_model["DeepSeek classifies competitor testimony"]
+    customer_model --> check["Python checks verdicts and source excerpts"]
+    competitor_model --> check
+    check -->|Supported agreement| sales["Point 4 decision"]
+    check -->|Conflicting or incomplete classifications| review["DeepSeek reviews available testimony together"]
+    review -->|Python checks review and handles missing evidence| sales
+    financial --> output["Company verdicts and evidence summary"]
+    sales --> output
+    output --> csv["Starter runner writes results.csv"]
+```
+
+The agent routes points 1 and 5 to one read-only SQL query that performs the
+arithmetic and comparisons. For point 4, it runs the two interview
+classifications independently and in parallel with the same LangChain
+`deepseek-v4-flash` model. Python checks that the cited text appears in the
+right transcript. If classifications disagree or a retrieved interview yields
+an unusable classification, a review call reads the available testimony
+together. An explicitly inconclusive review leaves point 4 missing. If the
+review request fails, the agent can still use an unopposed supported
+classification. Python assembles the verdicts and evidence into a short
+summary and preserves available results when another branch fails.
+
+### Public test results
+
+Run `python3 hw3.py --data-folder public_test` from the repository root.
+All three runs of the final version returned **60/60 correct verdicts** on 20
+companies, with a **balanced point score of 100.0%**. The runner computes
+that score as the mean of the accuracy on expected PASS and expected FAIL
+verdicts.
+
+| Fisher point | Expected PASS predicted correctly | Expected FAIL predicted correctly | Total correct |
+| --- | ---: | ---: | ---: |
+| 1 · Sales growth potential | 14/14 | 6/6 | 20/20 |
+| 4 · Sales organization | 14/14 | 6/6 | 20/20 |
+| 5 · Profit margin | 14/14 | 6/6 | 20/20 |
+| **All three points** | **42/42** | **18/18** | **60/60** |
+
+**Disagreements.** Every company matched all three public labels. For example,
+`hollins_group` passed point 1 with 19.29% revenue growth against a 16.20%
+industry median and passed point 5 with a 20.46% operating margin against a
+16.80% median. It failed point 4 because a customer reported receiving a price
+list from the sales team and relying on competitors for advice.
+
+The agent used two interviews per company, within the limit of ten. These
+results describe performance on the supplied public set.
+
+**Reference.** Philip A. Fisher, *Common Stocks and Uncommon Profits and Other
+Writings*, Part One, Chapters 3 and 4.
+
+## Task 2: Reflection
+
+Imagine asking the Fisher agent, “This company clearly has a strong sales team.
+Can you confirm?” If the interview evidence stays the same, “I think their
+sales team is weak” should lead to the same verdict. I understand AI
+sycophancy as a failure of that test. The model gives the user's stated view
+more weight than the evidence warrants. Sharma et al. found that responses
+matching users' views were more likely to be preferred in the human-feedback
+data they analyzed. That helps explain why a model trained to give responses
+people like can learn to agree too readily.
+[Sharma et al., *Towards Understanding Sycophancy in Language Models*](https://arxiv.org/abs/2310.13548)
+
+In a synthetic test for point 4, an early version returned PASS after a
+competitor said buyers came to **its** team for advice because the company
+being evaluated only supplied quotes. The excerpt was genuine, and the agent
+gave credit to the wrong team. This source-attribution error showed me how
+easily a plausible explanation can make a weak conclusion feel settled. The
+revised agent uses fixed criteria, reads the two accounts independently, and
+revisits the original testimony when the interpretations conflict. It can leave
+a verdict missing if the evidence stays inconclusive. Both readings use the
+same model, so they can still share the same blind spot.
+
+The term “AI psychosis” in the assignment is an informal label. My concern is
+how a chatbot may reinforce a person's delusional beliefs over a long
+conversation. A model can echo a user's interpretation, elaborate on it, and
+carry those elaborations into later replies. Its earlier guesses may then feel
+like independent confirmation to the user. Moore et al. observed patterns such
+as chatbot affirmation and endorsement of implausible beliefs in chat logs
+from people who reported harm. Those selected cases document what happened in
+the conversations. The frequency of these outcomes and the chatbot's causal
+role remain open questions.
+[Moore et al., *Characterizing Delusional Spirals through Human-LLM Chat Logs*](https://spirals.stanford.edu/assets/pdf/moore_characterizing_2026.pdf)
+
+In a sensitive conversation, I would want an assistant to acknowledge the
+person's distress and stay careful about the explanation. If someone feels that
+a coincidence contains a message meant for them, a response can recognize how
+unsettling it felt, ask what they directly observed, and leave the interpretation
+open. If the belief is causing distress or affecting important decisions, the
+assistant can encourage a conversation with a trusted person or a qualified
+professional. As a developer, I would test this over several turns, including
+whether the assistant becomes more certain merely because the user asks it to
+confirm the same claim again. For the Fisher agent, I would run the parallel
+test with bullish and bearish framings of the same evidence. In both settings,
+I would check whether the assistant holds a supported conclusion under repeated
+pressure and can revise it when new evidence appears.
